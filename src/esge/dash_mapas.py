@@ -6,6 +6,8 @@ import base64
 import io
 import json
 from pathlib import Path
+from unicodedata import normalize
+from xml.sax.saxutils import escape
 
 import folium
 from folium.features import DivIcon
@@ -433,7 +435,332 @@ def generate_locality_card_png(row: pd.Series, top_projects: pd.DataFrame) -> by
     return buf.getvalue()
 
 
-def generate_locality_card_pdf(row: pd.Series, top_projects: pd.DataFrame) -> bytes:
+def generate_locality_card_pdf(
+    row: pd.Series,
+    top_projects: pd.DataFrame,
+    local_projects: pd.DataFrame | None = None,
+) -> bytes:
+    """Crea una ficha ciudadana visual de una pagina para una localidad."""
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=letter,
+        leftMargin=32,
+        rightMargin=32,
+        topMargin=28,
+        bottomMargin=30,
+    )
+
+    navy = colors.HexColor("#102A43")
+    slate = colors.HexColor("#486581")
+    blue = colors.HexColor("#1677C8")
+    pale_blue = colors.HexColor("#EAF4FC")
+    pale = colors.HexColor("#F4F7FA")
+    border = colors.HexColor("#D9E2EC")
+    green = colors.HexColor("#0E9F6E")
+    amber = colors.HexColor("#D97706")
+    red = colors.HexColor("#DC2626")
+
+    base = ParagraphStyle(
+        "PdfBase", fontName="Helvetica", fontSize=8.2, leading=10.5, textColor=navy
+    )
+    small = ParagraphStyle(
+        "PdfSmall", parent=base, fontSize=6.9, leading=8.4, textColor=slate
+    )
+    section = ParagraphStyle(
+        "PdfSection", parent=base, fontName="Helvetica-Bold", fontSize=10.2,
+        leading=12, textColor=navy, spaceAfter=4
+    )
+    label = ParagraphStyle(
+        "PdfLabel", parent=base, fontName="Helvetica-Bold", fontSize=6.8,
+        leading=8, textColor=slate, alignment=1
+    )
+    value = ParagraphStyle(
+        "PdfValue", parent=base, fontName="Helvetica-Bold", fontSize=17,
+        leading=19, textColor=navy, alignment=1
+    )
+    card_title = ParagraphStyle(
+        "PdfCardTitle", parent=base, fontName="Helvetica-Bold", fontSize=8.1,
+        leading=9.8, textColor=navy
+    )
+
+    def paragraph(text: object, style=base) -> Paragraph:
+        return Paragraph(escape(str(text)), style)
+
+    total = int(row["total_pqrs"])
+    resueltas = int(row["resueltas"])
+    en_gestion = int(row["en_gestion"])
+    pendientes = int(row["pendientes"])
+    divisor = max(total, 1)
+    pct_resueltas = resueltas / divisor * 100
+    pct_gestion = en_gestion / divisor * 100
+    pct_pendientes = pendientes / divisor * 100
+    projects_data = local_projects if local_projects is not None else top_projects
+    total_projects = len(projects_data)
+    project_states = projects_data.get("estado_proyecto", pd.Series(dtype="object"))
+    project_state_keys = project_states.astype(str).map(
+        lambda item: normalize("NFKD", item).encode("ascii", "ignore").decode("ascii")
+    )
+    projects_executing = int((project_state_keys == "En ejecucion").sum())
+    projects_finished = int((project_states == "Finalizado").sum())
+
+    def metric_card(title: str, metric: str, accent: colors.Color) -> Table:
+        card = Table([[paragraph(title.upper(), label)], [paragraph(metric, value)]], colWidths=[127.5])
+        card.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+            ("BOX", (0, 0), (-1, -1), 0.5, border),
+            ("LINEBEFORE", (0, 0), (0, -1), 4, accent),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 4),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+        ]))
+        return card
+
+    story = []
+    brand = ParagraphStyle(
+        "PdfBrand", parent=base, fontName="Helvetica-Bold", fontSize=15, leading=16,
+        textColor=colors.white
+    )
+    header_location = ParagraphStyle(
+        "PdfHeaderLocation", parent=base, fontName="Helvetica-Bold", fontSize=10,
+        leading=13, textColor=colors.white, alignment=2
+    )
+    header = Table([[
+        Paragraph("<b>BOGOTA TRANSPARENTE</b><br/><font size=8>Ficha ciudadana de localidad</font>", brand),
+        Paragraph(f"<b>LOCALIDAD {escape(str(row['codigo']))}</b><br/>{escape(str(row['localidad']))}", header_location),
+    ]], colWidths=[350, 160])
+    header.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), navy),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 11),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 11),
+        ("LEFTPADDING", (0, 0), (0, -1), 14),
+        ("RIGHTPADDING", (-1, 0), (-1, -1), 14),
+    ]))
+    story.extend([header, Spacer(1, 7)])
+    story.append(Paragraph(
+        f"<b>Una mirada rapida a la atencion ciudadana y a los proyectos con mayor inversion en {escape(str(row['localidad']))}.</b> "
+        "Las cifras se presentan de forma agregada para facilitar la consulta publica.",
+        ParagraphStyle("PdfIntro", parent=base, fontSize=8.6, leading=11, textColor=slate),
+    ))
+    story.extend([Spacer(1, 7), Paragraph("1. PANORAMA DE PQRS", section)])
+    story.append(Table([[
+        metric_card("PQRS registradas", f"{total:,}", blue),
+        metric_card("PQRS resueltas", f"{pct_resueltas:.0f}%", green),
+        metric_card("En tramite", f"{en_gestion:,}", amber),
+        metric_card("Pendientes", f"{pendientes:,}", red),
+    ]], colWidths=[127.5] * 4, hAlign="LEFT"))
+    story.append(Spacer(1, 7))
+
+    fig, ax = plt.subplots(figsize=(2.35, 2.05), dpi=180)
+    sizes = [resueltas, en_gestion, pendientes]
+    if sum(sizes) > 0:
+        ax.pie(
+            sizes, colors=["#0E9F6E", "#D97706", "#DC2626"], startangle=90,
+            counterclock=False, wedgeprops=dict(width=0.32, edgecolor="white"),
+        )
+        ax.text(0, 0.08, f"{total:,}", ha="center", va="center", fontsize=14,
+                fontweight="bold", color="#102A43")
+        ax.text(0, -0.16, "PQRS", ha="center", va="center", fontsize=7.5, color="#486581")
+    else:
+        ax.text(0.5, 0.5, "Sin datos", ha="center", va="center", transform=ax.transAxes)
+    ax.set(aspect="equal")
+    fig.tight_layout(pad=0.2)
+    chart_buffer = io.BytesIO()
+    plt.savefig(chart_buffer, format="png", dpi=180, bbox_inches="tight", transparent=True)
+    plt.close(fig)
+    chart_buffer.seek(0)
+
+    state_rows = []
+    for state, count, percentage, color in [
+        ("Resueltas", resueltas, pct_resueltas, green),
+        ("En tramite", en_gestion, pct_gestion, amber),
+        ("Pendientes", pendientes, pct_pendientes, red),
+    ]:
+        amount = ParagraphStyle(
+            f"PdfAmount{state}", parent=base, fontName="Helvetica-Bold", fontSize=8.5,
+            textColor=color, alignment=2,
+        )
+        state_rows.append([paragraph(state, card_title), paragraph(f"{count:,}  |  {percentage:.1f}%", amount)])
+    states = Table(state_rows, colWidths=[180, 155], rowHeights=[26, 26, 26])
+    states.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), pale),
+        ("BOX", (0, 0), (-1, -1), 0.5, border),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.white),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+    ]))
+    attention = Table([[
+        Paragraph("2. COMO SE ATIENDE", section)
+    ], [Paragraph(
+        f"De cada 100 PQRS registradas en {escape(str(row['localidad']))}, <b>{pct_resueltas:.0f}</b> aparecen como resueltas. "
+        "La distribucion ayuda a reconocer donde concentrar el seguimiento ciudadano.", base
+    )], [states]], colWidths=[335])
+    attention.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "TOP"),
+        ("BOTTOMPADDING", (0, 0), (-1, 1), 3),
+    ]))
+    layout = Table([[RLImage(chart_buffer, width=155, height=136), attention]], colWidths=[165, 345])
+    layout.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+    story.extend([layout, Spacer(1, 6), Paragraph("3. PROYECTOS QUE DESTACAN", section)])
+
+    if top_projects.empty:
+        project_row = [Table([[paragraph("No hay proyectos reportados para esta localidad.", base)]], colWidths=[510])]
+    else:
+        project_row = []
+        for pos, (_, project) in enumerate(top_projects.head(3).reset_index(drop=True).iterrows()):
+            state = str(project.get("estado_proyecto", "Sin especificar"))
+            state_key = normalize("NFKD", state).encode("ascii", "ignore").decode("ascii")
+            state_color = {
+                "Finalizado": green, "En ejecucion": blue, "Programado": slate,
+                "Suspendido": amber, "Cancelado": red,
+            }.get(state_key, slate)
+            committed = float(project.get("presupuesto_millones", 0) or 0)
+            investment = f"$ {committed:,.1f} M comprometidos" if committed > 0 else "Sin valor comprometido reportado"
+            project_card = Table([[
+                paragraph(project.get("nombre_proyecto", "Proyecto sin nombre"), card_title)
+            ], [
+                paragraph(f"{project.get('sector', 'Sin sector')} | {state}", small)
+            ], [
+                paragraph(investment, ParagraphStyle(f"PdfInvestment{pos}", parent=small, fontName="Helvetica-Bold", fontSize=7.5, textColor=state_color))
+            ]], colWidths=[160])
+            project_card.setStyle(TableStyle([
+                ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+                ("BOX", (0, 0), (-1, -1), 0.5, border),
+                ("LINEABOVE", (0, 0), (-1, 0), 3, state_color),
+                ("TOPPADDING", (0, 0), (-1, -1), 5),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+                ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ]))
+            project_row.append(project_card)
+        while len(project_row) < 3:
+            project_row.append(Table([[paragraph("Sin otro proyecto destacado", small)]], colWidths=[160], style=[("BACKGROUND", (0, 0), (-1, -1), pale)]))
+    story.append(Table([project_row], colWidths=[160, 160, 160], hAlign="LEFT", style=[("VALIGN", (0, 0), (-1, -1), "TOP")]))
+
+    project_stats = Table([[
+        paragraph("TOTAL DE PROYECTOS", label),
+        paragraph("EN EJECUCION", label),
+        paragraph("FINALIZADOS", label),
+    ], [
+        paragraph(f"{total_projects:,}", ParagraphStyle("PdfProjectTotal", parent=value, fontSize=14)),
+        paragraph(f"{projects_executing:,}", ParagraphStyle("PdfProjectExecuting", parent=value, fontSize=14, textColor=blue)),
+        paragraph(f"{projects_finished:,}", ParagraphStyle("PdfProjectFinished", parent=value, fontSize=14, textColor=green)),
+    ]], colWidths=[160, 160, 160])
+    project_stats.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), pale),
+        ("BOX", (0, 0), (-1, -1), 0.5, border),
+        ("INNERGRID", (0, 0), (-1, -1), 0.35, colors.white),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.extend([Spacer(1, 5), project_stats, Spacer(1, 5)])
+
+    state_counts = project_state_keys.value_counts()
+    fig_state, ax_state = plt.subplots(figsize=(2.7, 1.35), dpi=180)
+    if not state_counts.empty:
+        state_colors = {
+            "Finalizado": "#0E9F6E", "En ejecucion": "#1677C8",
+            "Programado": "#486581", "Suspendido": "#D97706", "Cancelado": "#DC2626",
+        }
+        ax_state.pie(
+            state_counts.values,
+            colors=[state_colors.get(state, "#94A3B8") for state in state_counts.index],
+            startangle=90,
+            wedgeprops=dict(width=0.38, edgecolor="white"),
+        )
+        ax_state.text(0, 0, f"{total_projects}\nproyectos", ha="center", va="center", fontsize=7.5,
+                      fontweight="bold", color="#102A43")
+        ax_state.legend(state_counts.index, loc="center left", bbox_to_anchor=(0.92, 0.5),
+                        frameon=False, fontsize=5.8, handlelength=0.8)
+    else:
+        ax_state.text(0.5, 0.5, "Sin datos", ha="center", va="center", transform=ax_state.transAxes)
+    ax_state.set(aspect="equal")
+    fig_state.tight_layout(pad=0.1)
+    state_buffer = io.BytesIO()
+    plt.savefig(state_buffer, format="png", dpi=180, bbox_inches="tight", transparent=True)
+    plt.close(fig_state)
+    state_buffer.seek(0)
+
+    sector_values = (
+        projects_data.groupby("sector")["presupuesto_millones"].sum().sort_values().tail(4)
+        if not projects_data.empty and {"sector", "presupuesto_millones"}.issubset(projects_data.columns)
+        else pd.Series(dtype="float64")
+    )
+    fig_sector, ax_sector = plt.subplots(figsize=(2.75, 1.35), dpi=180)
+    if not sector_values.empty:
+        labels_sector = [item if len(item) <= 22 else item[:20] + "..." for item in sector_values.index]
+        ax_sector.barh(labels_sector, sector_values.values, color="#1677C8")
+        ax_sector.tick_params(axis="both", labelsize=5.8, length=0)
+        ax_sector.xaxis.set_visible(False)
+        for spine in ax_sector.spines.values():
+            spine.set_visible(False)
+    else:
+        ax_sector.text(0.5, 0.5, "Sin datos de inversion", ha="center", va="center", transform=ax_sector.transAxes)
+        ax_sector.axis("off")
+    fig_sector.tight_layout(pad=0.3)
+    sector_buffer = io.BytesIO()
+    plt.savefig(sector_buffer, format="png", dpi=180, bbox_inches="tight", transparent=True)
+    plt.close(fig_sector)
+    sector_buffer.seek(0)
+
+    chart_titles = Table([[
+        paragraph("ESTADO DE LOS PROYECTOS", ParagraphStyle("PdfProjectChartTitle", parent=label, alignment=0)),
+        paragraph("INVERSION POR SECTOR", ParagraphStyle("PdfSectorChartTitle", parent=label, alignment=0)),
+    ], [
+        RLImage(state_buffer, width=245, height=105),
+        RLImage(sector_buffer, width=245, height=105),
+    ]], colWidths=[255, 255])
+    chart_titles.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.white),
+        ("BOX", (0, 0), (-1, -1), 0.5, border),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, 0), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 0),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(chart_titles)
+
+    story.append(Spacer(1, 7))
+    action = Table([[
+        paragraph("4. QUE PUEDE HACER", ParagraphStyle("PdfActionTitle", parent=base, fontName="Helvetica-Bold", fontSize=8.8, textColor=navy)),
+        paragraph("Use esta ficha para conversar con su comunidad, hacer seguimiento a las PQRS y consultar los proyectos con mayor inversion disponible.", base),
+    ]], colWidths=[142, 368])
+    action.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), pale_blue),
+        ("LINEBEFORE", (0, 0), (0, -1), 4, blue),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ("LEFTPADDING", (0, 0), (-1, -1), 9),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 9),
+    ]))
+    story.extend([action, Spacer(1, 7)])
+    story.append(Paragraph(
+        "<b>Fuentes:</b> PQRS de la Secretaria Distrital de Gobierno y proyectos de Presupuestos Participativos de la Secretaria Distrital de Planeacion. "
+        "Los proyectos mostrados corresponden al mayor valor comprometido disponible; los registros sinteticos son solo de demostracion.",
+        small,
+    ))
+
+    def footer(canvas, document):
+        canvas.saveState()
+        canvas.setStrokeColor(border)
+        canvas.line(document.leftMargin, 18, letter[0] - document.rightMargin, 18)
+        canvas.setFont("Helvetica", 6.8)
+        canvas.setFillColor(slate)
+        canvas.drawString(document.leftMargin, 9, f"Bogota Transparente | Ficha {row['localidad']} | Datos agregados")
+        canvas.drawRightString(letter[0] - document.rightMargin, 9, "Dashboard Territorial Bogota D.C.")
+        canvas.restoreState()
+
+    doc.build(story, onFirstPage=footer, onLaterPages=footer)
+    return buf.getvalue()
+
+
+def _generate_locality_card_pdf_legacy(row: pd.Series, top_projects: pd.DataFrame) -> bytes:
     """Genera un reporte PDF formal de la localidad con gráfico de torta y Top 5 de proyectos."""
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
@@ -619,7 +946,8 @@ def get_cached_locality_pdfs(df_summary: pd.DataFrame, df_projects: pd.DataFrame
     pdf_dict = {}
     for _, row in df_summary.iterrows():
         top_p = get_top_projects_by_locality(df_projects, row["localidad"], top_n=5)
-        pdf_bytes = generate_locality_card_pdf(row, top_p)
+        local_p = df_projects[df_projects["localidad"] == row["localidad"]]
+        pdf_bytes = generate_locality_card_pdf(row, top_p, local_p)
         pdf_dict[row["localidad"]] = base64.b64encode(pdf_bytes).decode("utf-8")
     return pdf_dict
 
@@ -1071,6 +1399,7 @@ def main():
 
         sel_row_m = df_summary[df_summary["localidad"] == loc_map_descarga].iloc[0]
         top_proyectos_m = get_top_projects_by_locality(df_projects_raw, loc_map_descarga, top_n=5)
+        proyectos_locales_m = df_projects_raw[df_projects_raw["localidad"] == loc_map_descarga]
 
         with st.container():
             st.markdown(
@@ -1134,7 +1463,7 @@ def main():
 
             col_pdf_m, col_png_m, _ = st.columns([1.5, 1.5, 3])
 
-            pdf_bytes_m = generate_locality_card_pdf(sel_row_m, top_proyectos_m)
+            pdf_bytes_m = generate_locality_card_pdf(sel_row_m, top_proyectos_m, proyectos_locales_m)
             png_bytes_m = generate_locality_card_png(sel_row_m, top_proyectos_m)
 
             with col_pdf_m:
@@ -1331,6 +1660,7 @@ def main():
 
         sel_row = df_summary[df_summary["localidad"] == loc_ficha_name].iloc[0]
         top_proyectos_loc = get_top_projects_by_locality(df_projects_raw, loc_ficha_name, top_n=5)
+        proyectos_locales = df_projects_raw[df_projects_raw["localidad"] == loc_ficha_name]
 
         # Vista previa interactiva de la ficha
         with st.container():
@@ -1397,7 +1727,7 @@ def main():
 
             col_pdf_f, col_png_f, _ = st.columns([1.5, 1.5, 3])
 
-            pdf_bytes = generate_locality_card_pdf(sel_row, top_proyectos_loc)
+            pdf_bytes = generate_locality_card_pdf(sel_row, top_proyectos_loc, proyectos_locales)
             png_bytes = generate_locality_card_png(sel_row, top_proyectos_loc)
 
             with col_pdf_f:
